@@ -29,6 +29,8 @@ __all__ = (
     'setup_light_style_node_groups',
     'setup_sky_material',
     'setup_transparent_fullbright_material',
+    'setup_explosion_particle_material',
+    'setup_teleport_particle_material'
 )
 
 
@@ -87,14 +89,13 @@ def setup_light_style_node_groups():
 def _new_mat(name):
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
+    mat.blend_method = 'OPAQUE' # Default blend method
 
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
 
-    while nodes:
-        nodes.remove(nodes[0])
-    while links:
-        links.remove(links[0])
+    nodes.clear()
+    links.clear()
 
     return mat, nodes, links
 
@@ -154,19 +155,36 @@ class BlendMat:
         time_input.default_value = time
         time_input.keyframe_insert('default_value', frame=blender_frame)
 
-        fcurve = self.mat.node_tree.animation_data.action.fcurves.find(
-            'nodes["time"].outputs[0].default_value'
-        )
-        fcurve.keyframe_points[-1].interpolation = 'LINEAR'
+        if self.mat.node_tree.animation_data and self.mat.node_tree.animation_data.action:
+            fcurve = self.mat.node_tree.animation_data.action.fcurves.find(
+                'nodes["time"].outputs[0].default_value'
+            )
+            if fcurve:
+                fcurve.keyframe_points[-1].interpolation = 'LINEAR'
 
     def add_frame_keyframe(self, frame: int, blender_frame: int):
         frame_input = self.mat.node_tree.nodes['frame'].outputs['Value']
         frame_input.default_value = frame
         frame_input.keyframe_insert('default_value', frame=blender_frame)
 
-    def add_sample_as_light_keyframe(self, sample_as_light: bool, blender_frame: int):
-        self.mat.cycles.sample_as_light = sample_as_light
-        self.mat.cycles.keyframe_insert('sample_as_light', frame=blender_frame)
+    def add_sample_as_light_keyframe(self, vis, blender_frame):
+        if not self.mat.use_nodes:
+            return
+
+        emission_node = None
+        for node in self.mat.node_tree.nodes:
+            if node.type == 'EMISSION':
+                emission_node = node
+                break
+        
+        if emission_node:
+            strength = 10.0 if vis else 0.0
+            strength_input = emission_node.inputs.get('Strength')
+            if strength_input:
+                strength_input.default_value = strength
+                strength_input.keyframe_insert(data_path='default_value', frame=blender_frame)
+        else:
+            print(f"Warning: Material '{self.mat.name}' has no 'Emission' node to keyframe.")
 
     @property
     def is_animated(self):
@@ -230,7 +248,7 @@ def _setup_warp_uv(nodes, links, width, height):
 
 
 def _setup_image_nodes(ims: Iterable[Optional[bpy.types.Image]], nodes, links, output_name) -> \
-        Tuple[bpy.types.NodeSocketColor, List[bpy.types.NodeSocketFloatFactor]]:
+        Tuple[Optional[bpy.types.NodeSocket], List[bpy.types.NodeSocket], List[bpy.types.NodeSocket]]:
     texture_nodes = []
     for im in ims:
         if im is not None:
@@ -243,24 +261,14 @@ def _setup_image_nodes(ims: Iterable[Optional[bpy.types.Image]], nodes, links, o
 
     if len(texture_nodes) == 1:
         if texture_nodes[0] is None:
-            time_inputs = []
-            uv_inputs = []
-            colour_output = None
-        else:
-            time_inputs = []
-            uv_inputs = [texture_nodes[0].inputs['Vector']]
-            colour_output = texture_nodes[0].outputs[output_name]
+            return [], [], None
+        return [], [texture_nodes[0].inputs['Vector']], texture_nodes[0].outputs[output_name]
     elif len(texture_nodes) > 1:
-        if texture_nodes[0] is None:
-            prev_output = None
-        else:
-            prev_output = texture_nodes[0].outputs[output_name]
+        prev_output = texture_nodes[0].outputs[output_name] if texture_nodes[0] else None
 
         mul_node = nodes.new('ShaderNodeMath')
         mul_node.operation = 'MULTIPLY'
-        # empirically measured frame time to be 0.24s
-        # TODO: Find out why this is the case in the Quake source code.
-        mul_node.inputs[1].default_value = 1. / 0.24
+        mul_node.inputs[1].default_value = 1.0 / 0.1
         time_input = mul_node.inputs[0]
 
         mod_node = nodes.new('ShaderNodeMath')
@@ -274,92 +282,101 @@ def _setup_image_nodes(ims: Iterable[Optional[bpy.types.Image]], nodes, links, o
         frame_output = floor_node.outputs['Value']
 
         for frame_num, texture_node in enumerate(texture_nodes[1:], 1):
-            sub_node = nodes.new('ShaderNodeMath')
-            sub_node.operation = 'SUBTRACT'
-            sub_node.inputs[0].default_value = frame_num
-            links.new(sub_node.inputs[1], frame_output)
+            compare_node = nodes.new('ShaderNodeMath')
+            compare_node.operation = 'COMPARE'
+            compare_node.inputs[0].default_value = frame_num
+            links.new(compare_node.inputs[1], frame_output)
 
-            mix_node = nodes.new('ShaderNodeMixRGB')
-            if texture_node is not None:
-                links.new(mix_node.inputs['Color1'], texture_node.outputs[output_name])
+            mix_node = nodes.new('ShaderNodeMix')
+            mix_node.data_type = 'RGBA'
+            
+            if prev_output:
+                links.new(mix_node.inputs['A'], prev_output)
             else:
-                mix_node.inputs['Color1'].default_value = (0, 0, 0, 1)
-            if prev_output is None:
-                mix_node.inputs['Color2'].default_value = (0, 0, 0, 1)
+                mix_node.inputs['A'].default_value = (0, 0, 0, 1)
+                
+            if texture_node:
+                links.new(mix_node.inputs['B'], texture_node.outputs[output_name])
             else:
-                links.new(mix_node.inputs['Color2'], prev_output)
+                mix_node.inputs['B'].default_value = (0, 0, 0, 1)
 
-            links.new(mix_node.inputs['Fac'], sub_node.outputs['Value'])
+            links.new(mix_node.inputs['Factor'], compare_node.outputs['Value'])
+            prev_output = mix_node.outputs['Result']
 
-            prev_output = mix_node.outputs['Color']
-
-        time_inputs = [time_input]
         uv_inputs = [tn.inputs['Vector'] for tn in texture_nodes if tn is not None]
-        colour_output = prev_output
+        return [time_input], uv_inputs, prev_output
     else:
         raise ValueError('No images passed')
-
-    return time_inputs, uv_inputs, colour_output
 
 
 def _reduce(node_type: str, operation: str, it: Iterable[bpy.types.NodeSocket], nodes, links):
     iter_ = iter(it)
-    accum = next(iter_)
+    try:
+        accum = next(iter_)
+    except StopIteration:
+        return None
 
     for ns in iter_:
         op_node = nodes.new(node_type)
-        op_node.operation = operation
-        links.new(op_node.inputs[0], accum)
-        links.new(op_node.inputs[1], ns)
-        accum = op_node.outputs[0]
-
+        if hasattr(op_node, 'operation'):
+            op_node.operation = operation
+        if node_type == 'ShaderNodeMix':
+             op_node.data_type = 'RGBA'
+             links.new(op_node.inputs['A'], accum)
+             links.new(op_node.inputs['B'], ns)
+             accum = op_node.outputs['Result']
+        else:
+            links.new(op_node.inputs[0], accum)
+            links.new(op_node.inputs[1], ns)
+            output_socket_name = 'Vector' if 'Vector' in op_node.outputs else 'Value'
+            accum = op_node.outputs[output_socket_name]
+            
     return accum
 
 
 def _setup_alt_image_nodes(ims: BlendMatImages, nodes, links, warp: bool, fullbright: bool,
                            output_name: str = 'Color') -> \
-        Tuple[bpy.types.NodeSocketColor,
-              List[bpy.types.NodeSocketFloatFactor],
-              List[bpy.types.NodeSocketFloatFactor]]:
+        Tuple[Optional[bpy.types.NodeSocket], List[bpy.types.NodeSocket], List[bpy.types.NodeSocket]]:
     main_time_inputs, main_uv_inputs, main_output = _setup_image_nodes(
-        ((im_pair.fullbright_im if fullbright else im_pair.im)
-            for im_pair in ims.frames),
+        (p.fullbright_im if fullbright else p.im for p in ims.frames),
         nodes, links, output_name
     )
 
     time_inputs = main_time_inputs
     uv_inputs = main_uv_inputs
     frame_inputs = []
+
     if not ims.alt_frames:
         output = main_output
     else:
         alt_time_inputs, alt_uv_inputs, alt_output = _setup_image_nodes(
-            ((im_pair.fullbright_im if fullbright else im_pair.im)
-                for im_pair in ims.alt_frames),
+            (p.fullbright_im if fullbright else p.im for p in ims.alt_frames),
             nodes, links, output_name
         )
-
-        mix_node = nodes.new('ShaderNodeMixRGB')
-        if main_output is not None:
-            links.new(mix_node.inputs['Color1'], main_output)
+        
+        mix_node = nodes.new('ShaderNodeMix')
+        mix_node.data_type = 'RGBA'
+        
+        if main_output:
+            links.new(mix_node.inputs['A'], main_output)
         else:
-            mix_node.inputs['Color1'].default_value = (0, 0, 0, 1)
+            mix_node.inputs['A'].default_value = (0, 0, 0, 1)
 
-        if alt_output is not None:
-            links.new(mix_node.inputs['Color2'], alt_output)
+        if alt_output:
+            links.new(mix_node.inputs['B'], alt_output)
         else:
-            mix_node.inputs['Color2'].default_value = (0, 0, 0, 1)
+            mix_node.inputs['B'].default_value = (0, 0, 0, 1)
 
-        output = mix_node.outputs['Color']
-        time_inputs += alt_time_inputs
-        uv_inputs += alt_uv_inputs
-        frame_inputs += [mix_node.inputs['Fac']]
+        output = mix_node.outputs['Result']
+        time_inputs.extend(alt_time_inputs)
+        uv_inputs.extend(alt_uv_inputs)
+        frame_inputs.append(mix_node.inputs['Factor'])
 
     if warp:
         warp_time_inputs, uv_output = _setup_warp_uv(nodes, links, ims.width, ims.height)
         for uv_input in uv_inputs:
             links.new(uv_input, uv_output)
-        time_inputs += warp_time_inputs
+        time_inputs.extend(warp_time_inputs)
 
     return output, time_inputs, frame_inputs
 
@@ -372,239 +389,234 @@ def _create_value_node(inputs, nodes, links, name):
 
 
 def _create_inputs(frame_inputs, time_inputs, nodes, links):
-    if len(frame_inputs) > 0:
+    if frame_inputs:
         _create_value_node(frame_inputs, nodes, links, 'frame')
-    if len(time_inputs) > 0:
+    if time_inputs:
         _create_value_node(time_inputs, nodes, links, 'time')
 
 
-def setup_sky_material(ims: BlendMatImages, mat_name):
-    image = ims.frames[0].im
-
+def setup_sky_material(ims: BlendMatImages, mat_name: str):
     mat, nodes, links = _new_mat(mat_name)
-
+    image = ims.frames[0].im
+    
     output_node = nodes.new('ShaderNodeOutputMaterial')
+    mix_shader = nodes.new('ShaderNodeMixShader')
+    light_path = nodes.new('ShaderNodeLightPath')
+    transparent_bsdf = nodes.new('ShaderNodeBsdfTransparent')
+    emission = nodes.new('ShaderNodeEmission')
+    
+    links.new(output_node.inputs['Surface'], mix_shader.outputs['Shader'])
+    links.new(mix_shader.inputs['Fac'], light_path.outputs['Is Camera Ray'])
+    links.new(mix_shader.inputs[1], transparent_bsdf.outputs['BSDF'])
+    links.new(mix_shader.inputs[2], emission.outputs['Emission'])
+    
+    tex_coord = nodes.new('ShaderNodeTexCoord')
+    tex_front = nodes.new('ShaderNodeTexImage')
+    tex_front.image = image
+    tex_front.extension = 'REPEAT'
+    tex_back = nodes.new('ShaderNodeTexImage')
+    tex_back.image = image
+    tex_back.extension = 'REPEAT'
+    
+    map_front = nodes.new('ShaderNodeMapping')
+    map_front.inputs['Scale'].default_value = (0.5, 1, 1)
+    map_back = nodes.new('ShaderNodeMapping')
+    map_back.inputs['Location'].default_value = (0.5, 0, 0)
+    map_back.inputs['Scale'].default_value = (0.5, 1, 1)
+    
+    links.new(map_front.inputs['Vector'], tex_coord.outputs['Generated'])
+    links.new(map_back.inputs['Vector'], tex_coord.outputs['Generated'])
+    links.new(tex_front.inputs['Vector'], map_front.outputs['Vector'])
+    links.new(tex_back.inputs['Vector'], map_back.outputs['Vector'])
+    
+    time_node = nodes.new('ShaderNodeValue')
+    time_node.name = 'time'
+    
+    add_front_uv = nodes.new('ShaderNodeVectorMath')
+    add_front_uv.operation = 'ADD'
+    add_front_uv.inputs[1].default_value[0] = 0.25
+    links.new(add_front_uv.inputs[0], time_node.outputs['Value'])
+    
+    add_back_uv = nodes.new('ShaderNodeVectorMath')
+    add_back_uv.operation = 'ADD'
+    add_back_uv.inputs[1].default_value[0] = 0.125
+    links.new(add_back_uv.inputs[0], time_node.outputs['Value'])
 
-    mix_node = nodes.new('ShaderNodeMixShader')
-    links.new(output_node.inputs['Surface'], mix_node.outputs['Shader'])
-
-    light_path_node = nodes.new('ShaderNodeLightPath')
-    transparent_node = nodes.new('ShaderNodeBsdfTransparent')
-    emission_node = nodes.new('ShaderNodeEmission')
-    emission_node.inputs['Strength'].default_value = 0.25
-    links.new(mix_node.inputs['Fac'], light_path_node.outputs['Is Camera Ray'])
-    links.new(mix_node.inputs[1], transparent_node.outputs['BSDF'])
-    links.new(mix_node.inputs[2], emission_node.outputs['Emission'])
-
-    mix_rgb_node = nodes.new('ShaderNodeMixRGB')
-    links.new(emission_node.inputs['Color'], mix_rgb_node.outputs['Color'])
-
-    front_texture_node = nodes.new('ShaderNodeTexImage')
-    front_texture_node.image = image
-    back_texture_node = nodes.new('ShaderNodeTexImage')
-    back_texture_node.image = image
-    links.new(mix_rgb_node.inputs['Color1'], back_texture_node.outputs['Color'])
-    links.new(mix_rgb_node.inputs['Color2'], front_texture_node.outputs['Color'])
-    links.new(mix_rgb_node.inputs['Fac'], front_texture_node.outputs['Alpha'])
-
-    wrap_back_node = nodes.new('ShaderNodeVectorMath')
-    wrap_front_node = nodes.new('ShaderNodeVectorMath')
-    wrap_back_node.operation = 'WRAP'
-    wrap_back_node.inputs[1].default_value = (0.5, 0, 0)
-    wrap_back_node.inputs[2].default_value = (1, 1, 1)
-    wrap_front_node.operation = 'WRAP'
-    wrap_front_node.inputs[1].default_value = (0, 0, 0)
-    wrap_front_node.inputs[2].default_value = (0.5, 1, 1)
-    links.new(back_texture_node.inputs['Vector'], wrap_back_node.outputs[0])
-    links.new(front_texture_node.inputs['Vector'], wrap_front_node.outputs[0])
-
-    add_back_node = nodes.new('ShaderNodeVectorMath')
-    add_front_node = nodes.new('ShaderNodeVectorMath')
-    add_back_node.operation = 'ADD'
-    add_front_node.operation = 'ADD'
-    links.new(wrap_back_node.inputs[0], add_back_node.outputs[0])
-    links.new(wrap_front_node.inputs[0], add_front_node.outputs[0])
-
-    vec_mul2_node = nodes.new('ShaderNodeVectorMath')
-    back_vel_node = nodes.new('ShaderNodeVectorMath')
-    front_vel_node = nodes.new('ShaderNodeVectorMath')
-    vec_mul2_node.operation = 'MULTIPLY'
-    back_vel_node.operation = 'MULTIPLY'
-    front_vel_node.operation = 'MULTIPLY'
-    vec_mul2_node.inputs[1].default_value = (3, 3, 3)
-    back_vel_node.inputs[1].default_value = (.125, .125, .125)
-    front_vel_node.inputs[1].default_value = (.25, .25, .25)
-    links.new(add_back_node.inputs[0], vec_mul2_node.outputs['Vector'])
-    links.new(add_front_node.inputs[0], vec_mul2_node.outputs['Vector'])
-    links.new(add_back_node.inputs[1], back_vel_node.outputs['Vector'])
-    links.new(add_front_node.inputs[1], front_vel_node.outputs['Vector'])
-
-    _create_value_node([back_vel_node.inputs[0], front_vel_node.inputs[0]],
-                       nodes, links, 'time')
-
-    normalize_node = nodes.new('ShaderNodeVectorMath')
-    normalize_node.operation = 'NORMALIZE'
-    links.new(vec_mul2_node.inputs[0], normalize_node.outputs['Vector'])
-
-    vec_mul_node = nodes.new('ShaderNodeVectorMath')
-    vec_mul_node.operation = 'MULTIPLY'
-    vec_mul_node.inputs[1].default_value = (-1, -1, -3)
-    links.new(normalize_node.inputs['Vector'], vec_mul_node.outputs['Vector'])
-
-    geometry_node = nodes.new('ShaderNodeNewGeometry')
-    links.new(vec_mul_node.inputs[0], geometry_node.outputs['Incoming'])
+    add_front_loc = nodes.new('ShaderNodeVectorMath')
+    add_front_loc.operation = 'ADD'
+    links.new(add_front_loc.inputs[0], map_front.outputs['Vector'])
+    links.new(add_front_loc.inputs[1], add_front_uv.outputs['Vector'])
+    links.new(tex_front.inputs['Vector'], add_front_loc.outputs['Vector'])
+    
+    add_back_loc = nodes.new('ShaderNodeVectorMath')
+    add_back_loc.operation = 'ADD'
+    links.new(add_back_loc.inputs[0], map_back.outputs['Vector'])
+    links.new(add_back_loc.inputs[1], add_back_uv.outputs['Vector'])
+    links.new(tex_back.inputs['Vector'], add_back_loc.outputs['Vector'])
+    
+    mix_color = nodes.new('ShaderNodeMix')
+    mix_color.data_type = 'RGBA'
+    mix_color.blend_type = 'MIX'
+    
+    links.new(mix_color.inputs['A'], tex_back.outputs['Color'])
+    links.new(mix_color.inputs['B'], tex_front.outputs['Color'])
+    mix_color.inputs['Factor'].default_value = 0.5 
+    
+    links.new(emission.inputs['Color'], mix_color.outputs['Result'])
 
     return BlendMat(mat)
 
 
 def setup_diffuse_material(ims: BlendMatImages, mat_name: str, warp: bool):
     mat, nodes, links = _new_mat(mat_name)
-
     im_output, time_inputs, frame_inputs = _setup_alt_image_nodes(ims, nodes, links, warp=warp, fullbright=False)
-    diffuse_node = nodes.new('ShaderNodeBsdfDiffuse')
+    
+    principled_node = nodes.new('ShaderNodeBsdfPrincipled')
+    principled_node.inputs['Roughness'].default_value = 1.0
+    principled_node.inputs['Specular IOR Level'].default_value = 0.0
+
     output_node = nodes.new('ShaderNodeOutputMaterial')
-
-    links.new(diffuse_node.inputs['Color'], im_output)
-    links.new(output_node.inputs['Surface'], diffuse_node.outputs['BSDF'])
-
+    
+    if im_output:
+        links.new(principled_node.inputs['Base Color'], im_output)
+    links.new(output_node.inputs['Surface'], principled_node.outputs['BSDF'])
+    
     _create_inputs(frame_inputs, time_inputs, nodes, links)
-
     return BlendMat(mat)
 
 
-def setup_fullbright_material(ims: BlendMatImages, mat_name: str,
-                              strength: float, cam_strength: float, warp: bool):
+def setup_fullbright_material(ims: BlendMatImages, mat_name: str, strength: float, cam_strength: float, warp: bool):
     mat, nodes, links = _new_mat(mat_name)
-
-    diffuse_im_output, diffuse_time_inputs, diffuse_frame_inputs = _setup_alt_image_nodes(
-        ims, nodes, links, warp=warp, fullbright=False
-    )
-    fullbright_im_output, fullbright_time_inputs, fullbright_frame_inputs = _setup_alt_image_nodes(
-            ims, nodes, links, warp=warp, fullbright=True
-    )
+    
+    diffuse_im_output, diffuse_time_inputs, diffuse_frame_inputs = _setup_alt_image_nodes(ims, nodes, links, warp=warp, fullbright=False)
+    fullbright_im_output, fullbright_time_inputs, fullbright_frame_inputs = _setup_alt_image_nodes(ims, nodes, links, warp=warp, fullbright=True)
     time_inputs = diffuse_time_inputs + fullbright_time_inputs
     frame_inputs = diffuse_frame_inputs + fullbright_frame_inputs
 
-    diffuse_node = nodes.new('ShaderNodeBsdfDiffuse')
+    principled_node = nodes.new('ShaderNodeBsdfPrincipled')
+    principled_node.inputs['Roughness'].default_value = 1.0
+    principled_node.inputs['Specular IOR Level'].default_value = 0.0
+
     output_node = nodes.new('ShaderNodeOutputMaterial')
     add_node = nodes.new('ShaderNodeAddShader')
     emission_node = nodes.new('ShaderNodeEmission')
-
+    
     if strength == cam_strength:
         emission_node.inputs['Strength'].default_value = strength
     else:
         map_range_node = nodes.new('ShaderNodeMapRange')
-        map_range_node.inputs['From Min'].default_value = 0
-        map_range_node.inputs['From Max'].default_value = 1
-        map_range_node.inputs['To Min'].default_value = strength
-        map_range_node.inputs['To Max'].default_value = cam_strength
+        map_range_node.inputs[1].default_value = 0
+        map_range_node.inputs[2].default_value = 1
+        map_range_node.inputs[3].default_value = strength
+        map_range_node.inputs[4].default_value = cam_strength
         links.new(emission_node.inputs['Strength'], map_range_node.outputs['Result'])
-
         light_path_node = nodes.new('ShaderNodeLightPath')
         links.new(map_range_node.inputs['Value'], light_path_node.outputs['Is Camera Ray'])
 
-    links.new(diffuse_node.inputs['Color'], diffuse_im_output)
-    links.new(emission_node.inputs['Color'], fullbright_im_output)
-    links.new(add_node.inputs[0], diffuse_node.outputs['BSDF'])
+    if diffuse_im_output:
+        links.new(principled_node.inputs['Base Color'], diffuse_im_output)
+    if fullbright_im_output:
+        links.new(emission_node.inputs['Color'], fullbright_im_output)
+    
+    links.new(add_node.inputs[0], principled_node.outputs['BSDF'])
     links.new(add_node.inputs[1], emission_node.outputs['Emission'])
     links.new(output_node.inputs['Surface'], add_node.outputs['Shader'])
-
+    
     _create_inputs(frame_inputs, time_inputs, nodes, links)
-
     return BlendMat(mat)
 
 
 def setup_transparent_fullbright_material(ims: BlendMatImages, mat_name: str, strength: float, warp: bool):
     mat, nodes, links = _new_mat(mat_name)
+    mat.blend_method = 'BLEND'
+    #mat.shadow_method = 'NONE'
 
-    diffuse_im_output, diffuse_time_inputs, diffuse_frame_inputs = _setup_alt_image_nodes(
-        ims, nodes, links, warp=warp, fullbright=False
-    )
-    fullbright_im_output, fullbright_time_inputs, fullbright_frame_inputs = _setup_alt_image_nodes(
-        ims, nodes, links, warp=warp, fullbright=True
-    )
-    time_inputs = diffuse_time_inputs + fullbright_time_inputs
-    frame_inputs = diffuse_frame_inputs + fullbright_frame_inputs
+    diffuse_im_output, diffuse_time_inputs, diffuse_frame_inputs = _setup_alt_image_nodes(ims, nodes, links, warp=warp, fullbright=False)
+    alpha_output, alpha_time_inputs, alpha_frame_inputs = _setup_alt_image_nodes(ims, nodes, links, warp=warp, fullbright=True, output_name='Alpha')
+    time_inputs = diffuse_time_inputs + alpha_time_inputs
+    frame_inputs = diffuse_frame_inputs + alpha_frame_inputs
 
     emission_node = nodes.new('ShaderNodeEmission')
-    output_node = nodes.new('ShaderNodeOutputMaterial')
-    mix_node = nodes.new('ShaderNodeMixShader')
     transparent_node = nodes.new('ShaderNodeBsdfTransparent')
-
+    mix_shader_node = nodes.new('ShaderNodeMixShader')
+    output_node = nodes.new('ShaderNodeOutputMaterial')
+    
     emission_node.inputs['Strength'].default_value = strength
-
-    links.new(emission_node.inputs['Color'], diffuse_im_output)
-    links.new(mix_node.inputs[0], fullbright_im_output)
-    links.new(mix_node.inputs[1], transparent_node.outputs['BSDF'])
-    links.new(mix_node.inputs[2], emission_node.outputs['Emission'])
-    links.new(output_node.inputs['Surface'], mix_node.outputs['Shader'])
-
+    
+    if diffuse_im_output:
+        links.new(emission_node.inputs['Color'], diffuse_im_output)
+    if alpha_output:
+        links.new(mix_shader_node.inputs['Fac'], alpha_output)
+        
+    links.new(mix_shader_node.inputs[1], transparent_node.outputs['BSDF'])
+    links.new(mix_shader_node.inputs[2], emission_node.outputs['Emission'])
+    links.new(output_node.inputs['Surface'], mix_shader_node.outputs['Shader'])
+    
     _create_inputs(frame_inputs, time_inputs, nodes, links)
-
     return BlendMat(mat)
 
 
 def setup_explosion_particle_material(mat_name):
     mat, nodes, links = _new_mat(mat_name)
+    mat.blend_method = 'BLEND'
 
     output_node = nodes.new('ShaderNodeOutputMaterial')
-
     mix_node = nodes.new('ShaderNodeMixShader')
-    links.new(output_node.inputs['Surface'], mix_node.outputs['Shader'])
-
     emission_node = nodes.new('ShaderNodeEmission')
-    emission_node.inputs['Strength'].default_value = 10
     transparent_node = nodes.new('ShaderNodeBsdfTransparent')
+    blackbody_node = nodes.new('ShaderNodeBlackbody')
+    map_range_node = nodes.new('ShaderNodeMapRange')
+    div_node = nodes.new('ShaderNodeMath')
+    particle_info_node = nodes.new('ShaderNodeParticleInfo')
+
+    links.new(output_node.inputs['Surface'], mix_node.outputs['Shader'])
     links.new(mix_node.inputs[1], emission_node.outputs['Emission'])
     links.new(mix_node.inputs[2], transparent_node.outputs['BSDF'])
-
-    blackbody_node = nodes.new('ShaderNodeBlackbody')
     links.new(emission_node.inputs['Color'], blackbody_node.outputs['Color'])
-
-    map_range_node = nodes.new('ShaderNodeMapRange')
-    map_range_node.inputs['From Min'].default_value = 0
-    map_range_node.inputs['From Max'].default_value = 1
-    map_range_node.inputs['To Min'].default_value = 4000
-    map_range_node.inputs['To Max'].default_value = 500
     links.new(blackbody_node.inputs['Temperature'], map_range_node.outputs['Result'])
-
-    div_node = nodes.new('ShaderNodeMath')
-    div_node.operation = 'DIVIDE'
     links.new(map_range_node.inputs['Value'], div_node.outputs['Value'])
-    links.new(mix_node.inputs[0], div_node.outputs['Value'])
-
-    particle_info_node = nodes.new('ShaderNodeParticleInfo')
+    
+    links.new(mix_node.inputs['Fac'], div_node.outputs['Value'])
+    
     links.new(div_node.inputs[0], particle_info_node.outputs['Age'])
     links.new(div_node.inputs[1], particle_info_node.outputs['Lifetime'])
 
+    emission_node.inputs['Strength'].default_value = 10
+    map_range_node.inputs[1].default_value = 0
+    map_range_node.inputs[2].default_value = 1
+    map_range_node.inputs[3].default_value = 4000
+    map_range_node.inputs[4].default_value = 500
+    div_node.operation = 'DIVIDE'
+    
     return BlendMat(mat)
 
 
 def setup_teleport_particle_material(mat_name):
     mat, nodes, links = _new_mat(mat_name)
+    mat.blend_method = 'BLEND'
 
     output_node = nodes.new('ShaderNodeOutputMaterial')
-
     mix_node = nodes.new('ShaderNodeMixShader')
-    links.new(output_node.inputs['Surface'], mix_node.outputs['Shader'])
-
     emission_node = nodes.new('ShaderNodeEmission')
-    emission_node.inputs['Strength'].default_value = .5
     transparent_node = nodes.new('ShaderNodeBsdfTransparent')
-    links.new(mix_node.inputs[1], emission_node.outputs['Emission'])
-    links.new(mix_node.inputs[2], transparent_node.outputs['BSDF'])
-
     color_ramp_node = nodes.new('ShaderNodeValToRGB')
     div_node = nodes.new('ShaderNodeMath')
-    div_node.operation = 'DIVIDE'
-    links.new(emission_node.inputs['Color'], color_ramp_node.outputs['Color'])
-    links.new(mix_node.inputs[0], div_node.outputs['Value'])
-
     particle_info_node = nodes.new('ShaderNodeParticleInfo')
+    
+    links.new(output_node.inputs['Surface'], mix_node.outputs['Shader'])
+    links.new(mix_node.inputs[1], emission_node.outputs['Emission'])
+    links.new(mix_node.inputs[2], transparent_node.outputs['BSDF'])
+    links.new(emission_node.inputs['Color'], color_ramp_node.outputs['Color'])
+
+    links.new(mix_node.inputs['Fac'], div_node.outputs['Value'])
+    
     links.new(div_node.inputs[0], particle_info_node.outputs['Age'])
     links.new(div_node.inputs[1], particle_info_node.outputs['Lifetime'])
     links.new(color_ramp_node.inputs['Fac'], particle_info_node.outputs['Random'])
-
+    
+    emission_node.inputs['Strength'].default_value = 0.5
+    div_node.operation = 'DIVIDE'
+    
     return BlendMat(mat)
 
 
@@ -615,54 +627,68 @@ def setup_lightmap_material(mat_name: str, ims: BlendMatImages,
                             style_node_groups: Dict[int, bpy.types.ShaderNodeTree]):
     mat, nodes, links = _new_mat(mat_name)
 
-    im_output, time_inputs, frame_inputs = _setup_alt_image_nodes(
-        ims, nodes, links, warp=warp, fullbright=False
-    )
+    im_output, time_inputs, frame_inputs = _setup_alt_image_nodes(ims, nodes, links, warp=warp, fullbright=False)
     if ims.any_fullbright:
-        fullbright_im_output, fullbright_time_inputs, fullbright_frame_inputs = _setup_alt_image_nodes(
-            ims, nodes, links, warp=warp, fullbright=True, output_name='Alpha'
-        )
+        fullbright_im_output, fullbright_time_inputs, fullbright_frame_inputs = _setup_alt_image_nodes(ims, nodes, links, warp=warp, fullbright=True, output_name='Alpha')
         time_inputs.extend(fullbright_time_inputs)
         frame_inputs.extend(fullbright_frame_inputs)
 
     output_node = nodes.new('ShaderNodeOutputMaterial')
+    principled_node = nodes.new('ShaderNodeBsdfPrincipled')
+    principled_node.inputs['Roughness'].default_value = 1.0
+    principled_node.inputs['Specular IOR Level'].default_value = 0.0
+    links.new(output_node.inputs['Surface'], principled_node.outputs['BSDF'])
 
-    color_mul_node = nodes.new('ShaderNodeVectorMath')
-    color_mul_node.operation = 'MULTIPLY'
-    links.new(output_node.inputs['Surface'], color_mul_node.outputs['Vector'])
-    links.new(color_mul_node.inputs[0], im_output)
+    color_mul_node = nodes.new('ShaderNodeMix')
+    color_mul_node.data_type = 'RGBA'
+    color_mul_node.blend_type = 'MULTIPLY'
+    color_mul_node.inputs['Factor'].default_value = 1.0
+    links.new(principled_node.inputs['Base Color'], color_mul_node.outputs['Result'])
+    if im_output:
+        links.new(color_mul_node.inputs['A'], im_output)
 
     uv_node = nodes.new('ShaderNodeUVMap')
     uv_node.uv_map = lightmap_uv_layer_name
 
     lightmap_outputs = []
-    for lightmap_idx in (idx for idx in range(4) if lightmap_styles[idx] != 255):
-        lightmap_mul_node = nodes.new('ShaderNodeVectorMath')
-        lightmap_mul_node.operation = 'MULTIPLY'
-        lightmap_outputs.append(lightmap_mul_node.outputs[0])
+    for lightmap_idx in (idx for idx in range(min(4, len(lightmap_ims))) if lightmap_styles[idx] != 255):
+        lightmap_mul_node = nodes.new('ShaderNodeMix')
+        lightmap_mul_node.data_type = 'RGBA'
+        lightmap_mul_node.blend_type = 'MULTIPLY'
+        lightmap_mul_node.inputs['Factor'].default_value = 1.0
+        lightmap_outputs.append(lightmap_mul_node.outputs['Result'])
 
         lightmap_texture_node = nodes.new('ShaderNodeTexImage')
         lightmap_texture_node.image = lightmap_ims[lightmap_idx]
         lightmap_texture_node.interpolation = 'Linear'
         group_node = nodes.new('ShaderNodeGroup')
         group_node.node_tree = style_node_groups[lightmap_styles[lightmap_idx]]
-        links.new(lightmap_mul_node.inputs[0], lightmap_texture_node.outputs['Color'])
-        links.new(lightmap_mul_node.inputs[1], group_node.outputs['Value'])
-
+        
+        links.new(lightmap_mul_node.inputs['A'], lightmap_texture_node.outputs['Color'])
+        links.new(lightmap_mul_node.inputs['B'], group_node.outputs['Value'])
         links.new(lightmap_texture_node.inputs['Vector'], uv_node.outputs['UV'])
 
-    if not ims.any_fullbright:
-        links.new(color_mul_node.inputs[1],
-                  _reduce('ShaderNodeVectorMath', 'ADD', lightmap_outputs, nodes, links))
-    else:
-        mix_rgb_node = nodes.new('ShaderNodeMixRGB')
-        mix_rgb_node.inputs['Color2'].default_value = (1, 1, 1, 1)
-        links.new(color_mul_node.inputs[1], mix_rgb_node.outputs['Color'])
-        links.new(mix_rgb_node.inputs['Color1'],
-                  _reduce('ShaderNodeVectorMath', 'ADD', lightmap_outputs, nodes, links))
-        links.new(mix_rgb_node.inputs['Fac'], fullbright_im_output)
-    _create_inputs(frame_inputs, time_inputs, nodes, links)
+    lightmap_sum = _reduce('ShaderNodeMix', 'ADD', lightmap_outputs, nodes, links)
 
+    if not ims.any_fullbright:
+        if lightmap_sum:
+            links.new(color_mul_node.inputs['B'], lightmap_sum)
+        else:
+            color_mul_node.inputs['B'].default_value = (1, 1, 1, 1)
+    else:
+        mix_rgb_node = nodes.new('ShaderNodeMix')
+        mix_rgb_node.data_type = 'RGBA'
+        mix_rgb_node.blend_type = 'MIX'
+        mix_rgb_node.inputs['B'].default_value = (1, 1, 1, 1)
+        links.new(color_mul_node.inputs['B'], mix_rgb_node.outputs['Result'])
+        if lightmap_sum:
+            links.new(mix_rgb_node.inputs['A'], lightmap_sum)
+        else:
+            mix_rgb_node.inputs['A'].default_value = (0, 0, 0, 1)
+        if fullbright_im_output:
+            links.new(mix_rgb_node.inputs['Factor'], fullbright_im_output)
+            
+    _create_inputs(frame_inputs, time_inputs, nodes, links)
     return BlendMat(mat)
 
 
@@ -670,16 +696,45 @@ def setup_flat_material(mat_name: str, ims: BlendMatImages, warp: bool):
     mat, nodes, links = _new_mat(mat_name)
 
     im_output, time_inputs, frame_inputs = _setup_alt_image_nodes(ims, nodes, links, warp=warp, fullbright=False)
-
     output_node = nodes.new('ShaderNodeOutputMaterial')
-    links.new(output_node.inputs['Surface'], im_output)
+    emission_node = nodes.new('ShaderNodeEmission')
+    links.new(output_node.inputs['Surface'], emission_node.outputs['Emission'])
+
+    if not warp:
+        if im_output:
+            links.new(emission_node.inputs['Color'], im_output)
+    else:
+        color_mul_node = nodes.new('ShaderNodeMix')
+        color_mul_node.data_type = 'RGBA'
+        color_mul_node.blend_type = 'MULTIPLY'
+        color_mul_node.inputs['Factor'].default_value = 1.0
+        links.new(emission_node.inputs['Color'], color_mul_node.outputs['Result'])
+
+        if im_output:
+            links.new(color_mul_node.inputs['A'], im_output)
+        color_mul_node.inputs['B'].default_value = (0.25, 0.25, 0.25, 1.0)
+        
     _create_inputs(frame_inputs, time_inputs, nodes, links)
+    return BlendMat(mat)
 
-    color_mul_node = nodes.new('ShaderNodeVectorMath')
-    color_mul_node.operation = 'MULTIPLY'
-    links.new(output_node.inputs['Surface'], color_mul_node.outputs['Vector'])
 
-    links.new(color_mul_node.inputs[0], im_output)
-    color_mul_node.inputs[1].default_value = (0.25, 0.25, 0.25) if warp else (0, 0, 0)
-
+def setup_sky_material(ims: BlendMatImages, mat_name: str):
+    mat, nodes, links = _new_mat(mat_name)
+    image = ims.frames[0].im
+    
+    output_node = nodes.new('ShaderNodeOutputMaterial')
+    emission_node = nodes.new('ShaderNodeEmission')
+    links.new(output_node.inputs['Surface'], emission_node.outputs['Emission'])
+    
+    tex_node = nodes.new('ShaderNodeTexImage')
+    tex_node.image = image
+    links.new(emission_node.inputs['Color'], tex_node.outputs['Color'])
+    
+    tex_coord = nodes.new('ShaderNodeTexCoord')
+    links.new(tex_node.inputs['Vector'], tex_coord.outputs['Window'])
+    
+    # Add time node to make it animated
+    time_node = nodes.new('ShaderNodeValue')
+    time_node.name = 'time'
+    
     return BlendMat(mat)

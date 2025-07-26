@@ -35,7 +35,7 @@ BLENDMATS: Dict[str, blendmat.BlendMat] = {}
 
 @dataclass
 class BlendMdl:
-    am: "AliasMdl"
+    am: "mdl.AliasModel"
     obj: bpy_types.Object
     sub_objs: List[bpy_types.Object]
     sample_as_light_mats: Set[blendmat.BlendMat]
@@ -77,6 +77,8 @@ class BlendMdl:
 
     def set_invisible_to_camera(self):
         for sub_obj in self.sub_objs:
+            # UPDATED: `cycles_visibility` was removed in Blender 4.1.
+            # The property is now directly on the object.
             sub_obj.visible_camera = False
 
     def done(self, final_time: float, fps: float):
@@ -91,17 +93,18 @@ class BlendMdl:
                 loop_time += self._group_frame_times[-1]
 
         for sub_obj in self.sub_objs:
-            for c in sub_obj.data.shape_keys.animation_data.action.fcurves:
-                for kfp in c.keyframe_points:
-                    kfp.interpolation = 'LINEAR'
+            if sub_obj.data.shape_keys and sub_obj.data.shape_keys.animation_data:
+                for c in sub_obj.data.shape_keys.animation_data.action.fcurves:
+                    for kfp in c.keyframe_points:
+                        kfp.interpolation = 'LINEAR'
 
 
 def _set_uvs(mesh, am, tri_set):
-    mesh.uv_layers.new()
+    uv_layer_data = mesh.uv_layers.new(name="Mdl_UV")
 
     bm = bmesh.new()
     bm.from_mesh(mesh)
-    uv_layer = bm.loops.layers.uv[0]
+    uv_layer = bm.loops.layers.uv[uv_layer_data.name]
 
     for bm_face, tri_idx in zip(bm.faces, tri_set):
         tcs = am.get_tri_tcs(tri_idx)
@@ -110,17 +113,20 @@ def _set_uvs(mesh, am, tri_set):
             bm_loop[uv_layer].uv = s / am.header['skin_width'], t / am.header['skin_height']
 
     bm.to_mesh(mesh)
+    bm.free()
 
 
 def _simplify_pydata(verts, tris):
     vert_map = []
     new_tris = []
+    d = {}
     for tri in tris:
         new_tri = []
         for vert_idx in tri:
-            if vert_idx not in vert_map:
+            if vert_idx not in d:
+                d[vert_idx] = len(vert_map)
                 vert_map.append(vert_idx)
-            new_tri.append(vert_map.index(vert_idx))
+            new_tri.append(d[vert_idx])
         new_tris.append(new_tri)
 
     return ([verts[old_vert_idx] for old_vert_idx in vert_map], [], new_tris), vert_map
@@ -134,20 +140,19 @@ def _get_tri_set_fullbright_frac(am, tri_set, skin_idx):
         skin_area += np.sum(mask)
         fullbright_area += np.sum(mask * (skin >= 224))
 
-    return fullbright_area / skin_area
+    return fullbright_area / skin_area if skin_area > 0 else 0
 
 
 def _create_shape_key(obj, simple_frame, vert_map):
     shape_key = obj.shape_key_add(name=simple_frame.name)
-    for old_vert_idx, shape_key_vert in zip(vert_map, shape_key.data):
-        shape_key_vert.co = simple_frame.frame_verts[old_vert_idx]
+    for i, old_vert_idx in enumerate(vert_map):
+        shape_key.data[i].co = simple_frame.frame_verts[old_vert_idx]
     return shape_key
 
 
 def add_model(am, pal, mdl_name, obj_name, skin_num, mdl_cfg, initial_pose_num, do_materials):
-    pal = np.concatenate([pal, np.ones(256)[:, None]], axis=1)
+    pal = np.concatenate([pal, np.ones((256, 1))], axis=1)
 
-    # If the initial pose is a group frame, just load frames from that group.
     if am.frames[initial_pose_num].frame_type == mdl.FrameType.GROUP:
         group_frame = am.frames[initial_pose_num]
         timescale = mdl_cfg.get('timescale', 1)
@@ -159,14 +164,12 @@ def add_model(am, pal, mdl_name, obj_name, skin_num, mdl_cfg, initial_pose_num, 
             if frame.frame_type != mdl.FrameType.SINGLE:
                 raise Exception(f"Frame type {frame.frame_type} not supported for non-static models")
 
-    # Set up things specific to each tri-set
     sample_as_light_mats: Set[blendmat.BlendMat] = set()
     obj = bpy.data.objects.new(obj_name, None)
     sub_objs = []
     shape_keys = []
     bpy.context.scene.collection.objects.link(obj)
     for tri_set_idx, tri_set in enumerate(am.disjoint_tri_sets):
-        # Create the mesh and object
         subobj_name = f"{obj_name}_triset{tri_set_idx}"
         mesh = bpy.data.meshes.new(subobj_name)
         if am.frames[0].frame_type == mdl.FrameType.SINGLE:
@@ -181,7 +184,6 @@ def add_model(am, pal, mdl_name, obj_name, skin_num, mdl_cfg, initial_pose_num, 
         sub_objs.append(subobj)
         bpy.context.scene.collection.objects.link(subobj)
 
-        # Create shape keys, used for animation.
         if group_frame is None:
             shape_keys.append([
                 _create_shape_key(subobj, frame.frame, vert_map) for frame in am.frames
@@ -193,7 +195,6 @@ def add_model(am, pal, mdl_name, obj_name, skin_num, mdl_cfg, initial_pose_num, 
             ])
 
         if do_materials:
-            # Set up material
             sample_as_light = mdl_cfg['sample_as_light']
             mat_name = f"{mdl_name}_skin{skin_num}"
 
@@ -225,7 +226,6 @@ def add_model(am, pal, mdl_name, obj_name, skin_num, mdl_cfg, initial_pose_num, 
                         mat_name,
                         warp=False
                     )
-                bm.mat.cycles.sample_as_light = sample_as_light
 
                 if sample_as_light:
                     sample_as_light_mats.add(bm)
@@ -233,11 +233,9 @@ def add_model(am, pal, mdl_name, obj_name, skin_num, mdl_cfg, initial_pose_num, 
                 BLENDMATS[mat_name] = bm
             bm = BLENDMATS[mat_name]
 
-            # Apply the material
             mesh.materials.append(bm.mat)
             _set_uvs(mesh, am, tri_set)
 
     return BlendMdl(am, obj, sub_objs, sample_as_light_mats,
                     initial_pose_num, group_times, shape_keys,
                     mdl_cfg.get('no_anim', False))
-

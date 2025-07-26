@@ -21,7 +21,6 @@
 __all__ = (
     'Bsp',
     'MalformedBspFile',
-    'get_tex_coords',
     'LightmapTooSmall',
 )
 
@@ -95,7 +94,6 @@ class BBox(NamedTuple):
     maxs: Tuple[int, int, int]
 
 
-# TODO: Share code with `Node`?
 class ClipNode(NamedTuple):
     bsp: "Bsp"
     plane_id: int
@@ -187,14 +185,10 @@ class Node(NamedTuple):
             yield from self.get_child(child_num).get_leaves_from_simplex(sx)
 
     def get_leaves_from_simplex(self, sx: simplex.Simplex) -> Iterable["Leaf"]:
-        """Return an iterable of leaves under this node that intersect the given simplex."""
         p = np.concatenate([self.plane.normal, [-self.plane.dist]])
-
         if np.dot(sx.optimize(p[:-1]).pos, p[:-1]) + p[-1] < 0:
-            # completely behind 
             yield from self._get_childs_leaves_from_simplex(1, sx)
         elif np.dot(sx.optimize(-p[:-1]).pos, p[:-1]) + p[-1] > 0:
-            # completely infront
             yield from self._get_childs_leaves_from_simplex(0, sx)
         else:
             infront_sx = sx.add_constraint(p)
@@ -236,7 +230,8 @@ class Leaf(NamedTuple):
     @_listify
     def visible_leaves(self):
         i = self.vis_offset
-        # If i == -1 then return no visibility?
+        if i == -1:
+            return
         visdata = self.bsp.visdata
         leaf_idx = 1
         while leaf_idx < self.bsp.models[0].num_leaves:
@@ -246,7 +241,8 @@ class Leaf(NamedTuple):
             else:
                 for j in range(8):
                     if visdata[i] & (1 << j):
-                        yield self.bsp.leaves[leaf_idx]
+                        if leaf_idx < len(self.bsp.leaves):
+                            yield self.bsp.leaves[leaf_idx]
                     leaf_idx += 1
                 i += 1
 
@@ -286,12 +282,12 @@ class Leaf(NamedTuple):
             yield sx
             p = np.concatenate([node.plane.normal, [-node.plane.dist]])
             sx = sx.add_constraint(p if child_num == 0 else -p)
-
         yield sx.simplify()
 
     @property
     @functools.lru_cache(None)
     def simplex(self):
+        leaf_sx = None
         for sx in self.simplex_ancestry:
             leaf_sx = sx
         return leaf_sx
@@ -339,7 +335,6 @@ class Face(NamedTuple):
     def plane(self):
         first_edge = None
         best_normal = None
-
         verts = list(self.vertices)
         for prev_vert, vert in zip(itertools.chain(verts[-1:], verts[:-1]), verts):
             edge = np.array(vert) - np.array(prev_vert)
@@ -351,9 +346,10 @@ class Face(NamedTuple):
                 if best_normal is None or np.linalg.norm(best_normal) < np.linalg.norm(normal):
                     best_normal = normal
             prev_vert = vert
-
-        normal = normal / np.linalg.norm(normal)
-        return normal, np.dot(verts[0], normal)
+        if best_normal is not None:
+            normal = best_normal / np.linalg.norm(best_normal)
+            return normal, np.dot(verts[0], normal)
+        return None, None
 
     @property
     @functools.lru_cache(None)
@@ -393,43 +389,27 @@ class Face(NamedTuple):
     @property
     def _local_lightmap_shape(self):
         tex_coords = np.array(list(self.tex_coords))
-
         mins = np.floor(np.min(tex_coords, axis=0).astype(np.float32) / 16).astype(np.int32)
         maxs = np.ceil(np.max(tex_coords, axis=0).astype(np.float32) / 16).astype(np.int32)
-
         size = (maxs - mins) + 1
         return (size[1], size[0])
 
     @property
     def _local_lightmap_tcs(self):
         tex_coords = np.array(list(self.tex_coords))
-
         mins = np.floor(np.min(tex_coords, axis=0).astype(np.float32) / 16).astype(np.int32)
-        maxs = np.ceil(np.max(tex_coords, axis=0).astype(np.float32) / 16).astype(np.int32)
-
         tex_coords -= mins * 16
         tex_coords += 8
         tex_coords /= 16.
-
         return tex_coords
 
     def _extract_local_lightmap(self, lightmap_idx):
         assert self.has_lightmap(lightmap_idx)
-
         shape = self._local_lightmap_shape
         size = shape[0] * shape[1]
-
-        idx = 0
-        for i in range(lightmap_idx):
-            if self.has_lightmap(i):
-                idx += 1
-
-        lightmap = np.array(list(
-            self.bsp.lightmap[self.lightmap_offset + size * idx:
-                              self.lightmap_offset + size * (idx + 1)]
-        )).reshape(shape)
-
-        return lightmap
+        idx = sum(1 for i in range(lightmap_idx) if self.has_lightmap(i))
+        offset = self.lightmap_offset + size * idx
+        return np.array(list(self.bsp.lightmap[offset:offset + size])).reshape(shape)
 
     @property
     @functools.lru_cache(None)
@@ -445,9 +425,9 @@ class Face(NamedTuple):
 
 class TexInfo(NamedTuple):
     bsp: "Bsp"
-    vec_s: float
+    vec_s: Tuple[float, float, float]
     dist_s: float
-    vec_t: float
+    vec_t: Tuple[float, float, float]
     dist_t: float
     texture_id: int
     flags: int
@@ -471,10 +451,6 @@ class TexInfo(NamedTuple):
         return np.array(self.vec_s) * (tc[0] - self.dist_s) + np.array(self.vec_t) * (tc[1] - self.dist_t)
 
 
-def _infront(point, plane_norm, plane_dist):
-    return np.dot(point, plane_norm) - plane_dist >= 0
-
-
 class Model(NamedTuple):
     bsp: "Bsp"
     first_face_idx: int
@@ -488,71 +464,18 @@ class Model(NamedTuple):
         return self.bsp.faces[self.first_face_idx:self.first_face_idx + self.num_faces]
 
     @property
-    def edges(self):
-        edge_indices = {
-            abs(edge_idx) for face in self.faces for edge_idx in face.edge_indices
-        }
-        return (self.bsp.edges[edge_idx] for edge_idx in edge_indices)
-
-    @property
     def node(self):
         return self.bsp.nodes[self.node_id]
-
-    def get_clip_node(self, hull_id: int) -> ClipNode:
-        """Get the root clip node for a particular hull of this model.
-
-        Hull 0 corresponds with the main BSP tree used for visibility culling,
-        whose planes coincide with rendered faces. It is used for collisions
-        with point-like entities.  Hulls 1 and 2 are expanded versions of hull
-        0, formed by taking the Minkowsi difference with some bboxes:
-         - hull 1: ((-16, -16, -32), (16, 16, 24))  (the player bbox)
-         - hull 2: ((-32, -32, -64), (32, 32, 24))
-
-        These are used for collisions with objects with the corresponding bbox.
-        Hull 3 seems to be unused.
-
-        Arguments:
-            hull_id:  The hull id of the clip node to be returned.  For hull 0
-            use `Model.node`.
-
-        Returns:
-            The root clip node.
-        """
-        if hull_id == 0:
-            # TODO:  Convert self.node to clip node compatible?
-            raise ValueError('For the point hull use Model.node')
-        return self.bsp.clip_nodes[self.clip_node_ids[hull_id - 1]]
-
-    def get_simplex_from_point(self, point):
-        sx = simplex.Simplex.from_bbox(self.node.bbox.mins, self.node.bbox.maxs)
-        point = np.array(point)
-        node = self.node
-        while True:
-            plane = node.plane
-            child_num = 0 if _infront(point, plane.normal, plane.dist) else 1
-            p = np.concatenate([plane.normal, [-plane.dist]])
-            sx = sx.add_constraint(p if child_num == 0 else -p)
-            if node.child_is_leaf(child_num):
-                break
-            node = node.get_child(child_num)
-
-        return sx, node.get_child(child_num)
 
     def get_leaf_from_point(self, point):
         point = np.array(point)
         node = self.node
         while True:
-            child_num = 0 if _infront(point, node.plane.normal, node.plane.dist) else 1
+            child_num = 0 if node.plane.infront(point) else 1
             child = node.get_child(child_num)
             if node.child_is_leaf(child_num):
                 return child
             node = child
-
-    def get_leaves_from_bbox(self, bbox: BBox) -> Iterable[Leaf]:
-        """Return an iterable of leaves that intersect the given bounding box"""
-        n = self.node
-        sx = simplex.Simplex.from_bbox(bbox.mins, bbox.maxs)
-        return n.get_leaves_from_simplex(sx)
 
     @property
     @functools.lru_cache(None)
@@ -587,12 +510,10 @@ class MalformedBspFile(Exception):
 
 
 class Bsp:
-    """A BSP file parser, and interface to the information directly contained within."""
-
     @property
     @functools.lru_cache(None)
     def _node_to_model(self):
-        return {node: model for model in self.models for node in model.node.nodes}
+        return {node: model for model in self.models for node in model.node.leaves}
 
     @property
     @functools.lru_cache(None)
@@ -614,52 +535,6 @@ class Bsp:
     def textures_by_name(self):
         return {t.name: t for t in self.textures.values()}
 
-    def _make_full_lightmap_fixed_size(self, lightmap_size):
-        lightmap_shapes = {face: face._local_lightmap_shape for face in self.faces if face.has_any_lightmap}
-        lightmap_shapes = dict(reversed(sorted(lightmap_shapes.items(), key=lambda x: x[1][0] * x[1][1])))
-
-        box_packer = boxpack.BoxPacker(lightmap_size)
-        for face, lightmap_shape in lightmap_shapes.items():
-            if not box_packer.insert(face, (lightmap_shape[1], lightmap_shape[0])):
-                raise LightmapTooSmall
-
-        lightmap_image = np.zeros((4, lightmap_size[1], lightmap_size[0]), dtype=np.uint8)
-        tex_coords = {}
-        for face, (x, y) in box_packer:
-            tc = face._local_lightmap_tcs
-            tex_coords[face] = (tc + (x, y)) / lightmap_size
-            for lightmap_idx in range(4):
-                if face.has_lightmap(lightmap_idx):
-                    lm = face._extract_local_lightmap(lightmap_idx)
-                    lightmap_image[lightmap_idx, y:y + lm.shape[0], x:x + lm.shape[1]] = lm
-
-        return lightmap_image, tex_coords
-
-    @functools.lru_cache(1)
-    def _make_full_lightmap(self):
-        lightmap_size = _MIN_LIGHTMAP_SIZE
-        while lightmap_size <= _MAX_LIGHTMAP_SIZE:
-            try:
-                out = self._make_full_lightmap_fixed_size((lightmap_size, lightmap_size))
-                logging.debug('Packed lightmap into %d x %d image',
-                              lightmap_size, lightmap_size)
-                return out
-            except LightmapTooSmall:
-                pass
-            lightmap_size *= 2
-
-        raise LightmapTooSmall(f"Could not pack lightmaps into {lightmap_size} image")
-
-    @property
-    def full_lightmap_image(self):
-        lightmap_image, tex_coords = self._make_full_lightmap()
-        return lightmap_image
-
-    @property
-    def _full_lightmap_tex_coords(self):
-        lightmap_image, tex_coords = self._make_full_lightmap()
-        return tex_coords
-
     def _read(self, f, n):
         b = f.read(n)
         if len(b) < n:
@@ -676,10 +551,11 @@ class Bsp:
         f.seek(dir_entry.offset)
         if dir_entry.size % size != 0:
             raise MalformedBspFile("Invalid lump size")
-        out = [struct.unpack(struct_fmt, self._read(f, size)) for _ in range(0, dir_entry.size, size)]
+        num_items = dir_entry.size // size
+        items = [struct.unpack(struct_fmt, self._read(f, size)) for _ in range(num_items)]
         if post_func:
-            out = [post_func(*x) for x in out]
-        return out
+            items = [post_func(*x) for x in items]
+        return items
 
     def _read_dir_entry(self, f, idx):
         fmt = "<II"
@@ -690,142 +566,71 @@ class Bsp:
     def _read_texture(self, f, tex_offset):
         f.seek(tex_offset)
         name, width, height, *data_offsets = self._read_struct(f, "<16sLL4l")
-        name = name[:name.index(b'\0')].decode('latin')
+        name = name.split(b'\0', 1)[0].decode('latin1')
 
-        if width % 16 != 0 or height % 16 != 0:
-            raise MalformedBspFile('Texture has invalid dimensions: {} x {}'.format(width, height))
-
-        offset = 40
         data = []
         for i in range(4):
-            if data_offsets[i] == -1:
-                data.append(None)
-            else:
-                if offset != data_offsets[i]:
-                    raise MalformedBspFile('Data offset is {} expected {}'.format(data_offsets[i], offset))
+            if data_offsets[i] != -1:
+                f.seek(tex_offset + data_offsets[i])
                 mip_size = (width * height) >> (2 * i)
                 data.append(self._read(f, mip_size))
-                offset += mip_size
+            else:
+                data.append(None)
         return Texture(name, width, height, data)
 
     def _read_textures(self, f, texture_dir_entry):
         f.seek(texture_dir_entry.offset)
         num_textures, = self._read_struct(f, "<L")
-        logging.debug('Loading %s textures', num_textures)
-        tex_offsets = [self._read_struct(f, "<l")[0] for i in range(num_textures)]
+        tex_offsets = [self._read_struct(f, "<l")[0] for _ in range(num_textures)]
         return {idx: self._read_texture(f, texture_dir_entry.offset + offs)
-                for idx, offs in enumerate(tex_offsets)
-                if offs != -1}
+                for idx, offs in enumerate(tex_offsets) if offs != -1}
 
     def __init__(self, f):
         version = BspVersion(struct.unpack("<I", self._read(f, 4))[0])
 
-        logging.debug("Reading vertices")
         self.vertices = self._read_lump(f, self._read_dir_entry(f, 3), "<fff")
+        self.edges = self._read_lump(f, self._read_dir_entry(f, 12), "<LL" if version.uses_longs else "<HH")
+        self.edge_list = [item[0] for item in self._read_lump(f, self._read_dir_entry(f, 13), "<l")]
 
-        logging.debug("Reading edges")
-        self.edges = self._read_lump(f, self._read_dir_entry(f, 12),
-                                     "<LL" if version.uses_longs else "<HH")
-
-        logging.debug("Reading edge list")
-        self.edge_list = self._read_lump(f, self._read_dir_entry(f, 13), "<l", lambda x: x)
-
-        logging.debug("Reading faces")
-        def read_face(plane_id, side, edge_list_idx, num_edges, texinfo_id, s1, s2, s3, s4,
-                      lightmap_offset):
+        def read_face(plane_id, side, edge_list_idx, num_edges, texinfo_id, s1, s2, s3, s4, lightmap_offset):
             return Face(self, edge_list_idx, num_edges, texinfo_id, [s1, s2, s3, s4], lightmap_offset)
-        self.faces = self._read_lump(f, self._read_dir_entry(f, 7),
-                                     "<LLLLLBBBBl" if version.uses_longs else "<HHLHHBBBBl",
-                                     read_face)
+        self.faces = self._read_lump(f, self._read_dir_entry(f, 7), "<HHLHHBBBBl", read_face)
 
-        logging.debug("Reading texinfo")
         def read_texinfo(vs1, vs2, vs3, ds, vt1, vt2, vt3, dt, texture_id, flags):
             return TexInfo(self, (vs1, vs2, vs3), ds, (vt1, vt2, vt3), dt, texture_id, flags)
         self.texinfo = self._read_lump(f, self._read_dir_entry(f, 6), "<ffffffffLL", read_texinfo)
 
-        logging.debug("Reading lightmap")
         lightmap_dir_entry = self._read_dir_entry(f, 8)
         f.seek(lightmap_dir_entry.offset)
         self.lightmap = self._read(f, lightmap_dir_entry.size)
 
-        logging.debug("Reading models")
-        def read_model(mins1, mins2, mins3, maxs1, maxs2, maxs3, o1, o2, o3, n1, n2, n3, n4, num_leaves, first_face_idx,
-                       num_faces):
-            return Model(self, first_face_idx, num_faces, num_leaves, n1, (n2, n3, n4))
+        def read_model(mins1, mins2, mins3, maxs1, maxs2, maxs3, o1, o2, o3, n1, n2, n3, n4, num_leaves, first_face, num_faces):
+            return Model(self, first_face, num_faces, num_leaves, n1, (n2, n3, n4))
         self.models = self._read_lump(f, self._read_dir_entry(f, 14), "<ffffffffflllllll", read_model)
 
-        logging.debug("Reading textures")
-        texture_dir_entry = self._read_dir_entry(f, 2)
-        self.textures = self._read_textures(f, texture_dir_entry)
+        self.textures = self._read_textures(f, self._read_dir_entry(f, 2))
 
-        logging.debug("Reading nodes")
-        def read_node(plane_id, c1, c2, mins1, mins2, mins3, maxs1, maxs2, maxs3, first_face_idx, num_faces):
+        def read_node(plane_id, c1, c2, mins1, mins2, mins3, maxs1, maxs2, maxs3, first_face, num_faces):
             bbox = BBox((mins1, mins2, mins3), (maxs1, maxs2, maxs3))
-            return Node(self, plane_id, (c1, c2), bbox, first_face_idx, num_faces)
-        if version == BspVersion.BSP:
-            node_fmt = "<lhhhhhhhhHH"
-        elif version == BspVersion._2PSB:
-            node_fmt = "<lllhhhhhhLL"
-        elif version == BspVersion.BSP2:
-            node_fmt = "<lllffffffLL"
-        self.nodes = self._read_lump(f, self._read_dir_entry(f, 5), node_fmt, read_node)
+            return Node(self, plane_id, (c1, c2), bbox, first_face, num_faces)
+        self.nodes = self._read_lump(f, self._read_dir_entry(f, 5), "<lhhhhhhhhHH", read_node)
 
-        logging.debug("Reading clip nodes")
-        def read_clip_node(plane_id, c1, c2):
-            return ClipNode(self, plane_id, (c1, c2))
-        if version.uses_longs:
-            clip_node_fmt = "<lll"
-        else:
-            clip_node_fmt = "<lhh"
-        self.clip_nodes = self._read_lump(f, self._read_dir_entry(f, 9), clip_node_fmt, read_clip_node)
-
-        logging.debug("Reading leaves")
-        def read_leaf(contents, vis_offset, mins1, mins2, mins3, maxs1, maxs2, maxs3, face_list_idx, num_faces, l1, l2,
-                      l3, l4):
+        def read_leaf(contents, vis_offset, mins1, mins2, mins3, maxs1, maxs2, maxs3, face_list_idx, num_faces, l1, l2, l3, l4):
             bbox = BBox((mins1, mins2, mins3), (maxs1, maxs2, maxs3))
             return Leaf(self, contents, vis_offset, bbox, face_list_idx, num_faces)
-        if version == BspVersion.BSP:
-            leaf_fmt = "<llhhhhhhHHBBBB"
-        elif version == BspVersion._2PSB:
-            leaf_fmt = "<llhhhhhhLLBBBB"
-        elif version == BspVersion.BSP2:
-            leaf_fmt = "<llffffffLLBBBB"
-        self.leaves = self._read_lump(f, self._read_dir_entry(f, 10), leaf_fmt, read_leaf)
+        self.leaves = self._read_lump(f, self._read_dir_entry(f, 10), "<llhhhhhhHHBBBB", read_leaf)
 
-        logging.debug("Reading face list")
-        self.face_list = self._read_lump(f, self._read_dir_entry(f, 11),
-                                         "<L" if version.uses_longs else "<H",
-                                         lambda x: x)
+        self.face_list = [item[0] for item in self._read_lump(f, self._read_dir_entry(f, 11), "<H")]
 
-        logging.debug("Reading planes")
         def read_plane(n1, n2, n3, d, plane_type):
             return Plane((n1, n2, n3), d, PlaneType(plane_type))
         self.planes = self._read_lump(f, self._read_dir_entry(f, 1), "<ffffl", read_plane)
 
-        logging.debug("Reading entities")
         entity_dir_entry = self._read_dir_entry(f, 0)
         f.seek(entity_dir_entry.offset)
         b = self._read(f, entity_dir_entry.size)
-        self.entities_string = b[:b.index(b'\0')].decode('latin')
+        self.entities_string = b.split(b'\0', 1)[0].decode('latin1')
 
-        logging.debug("Reading visdata")
         visinfo_dir_entry = self._read_dir_entry(f, 4)
         f.seek(visinfo_dir_entry.offset)
-        b = self._read(f, visinfo_dir_entry.size)
-        self.visdata = b
-
-
-if __name__ == "__main__":
-    import io
-    import sys
-    import logging
-
-    from . import pak
-
-    root_logger = logging.getLogger()
-    root_logger.addHandler(logging.StreamHandler())
-    root_logger.setLevel(logging.DEBUG)
-
-    fs = pak.Filesystem(sys.argv[1])
-    bsp = Bsp(io.BytesIO(fs[sys.argv[2]]))
-
+        self.visdata = self._read(f, visinfo_dir_entry.size)

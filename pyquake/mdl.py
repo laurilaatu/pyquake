@@ -223,7 +223,7 @@ class AliasModel:
         # Augmenting the third row with ones ensures that the coefficients sum to 1.  Finally we use the property that
         # in any such situation a point is inside the triange iff its coefficients are all positive, with some special
         # handling for degenerate triangles.
-        tcs = self.get_tri_tcs(tri_idx).astype(np.int)
+        tcs = self.get_tri_tcs(tri_idx).astype(np.int64)
         
         x_min, y_min = np.min(tcs, axis=0)
         x_max, y_max = np.max(tcs, axis=0)

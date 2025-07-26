@@ -88,23 +88,25 @@ def _make_path_material(name):
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
 
-    while nodes:
-        nodes.remove(nodes[0])
-    while links:
-        links.remove(links[0])
+    nodes.clear()
+    links.clear()
 
-    diffuse_node = nodes.new('ShaderNodeBsdfDiffuse')
+    # UPDATED: Use the standard Principled BSDF node instead of the legacy Diffuse BSDF.
+    principled_node = nodes.new('ShaderNodeBsdfPrincipled')
+    principled_node.inputs['Base Color'].default_value = (1, 0, 1, 1)
+    principled_node.inputs['Roughness'].default_value = 1.0
+    principled_node.inputs['Specular IOR Level'].default_value = 0.0 # Renamed in Blender 4.0
+
     transparent_node = nodes.new('ShaderNodeBsdfTransparent')
+    transparent_node.inputs['Color'].default_value = (1, 1, 1, 1)
+
     mix_node = nodes.new('ShaderNodeMixShader')
+    mix_node.inputs['Fac'].default_value = 0.2
+    
     output_node = nodes.new('ShaderNodeOutputMaterial')
 
-    transparent_node.inputs[0].default_value = (1, 1, 1, 1)
-    diffuse_node.inputs[0].default_value = (1, 0, 1, 1)
-    mix_node.inputs[0].default_value = 0.2
-
     links.new(mix_node.inputs[1], transparent_node.outputs['BSDF'])
-    links.new(mix_node.inputs[2], diffuse_node.outputs['BSDF'])
-
+    links.new(mix_node.inputs[2], principled_node.outputs['BSDF'])
     links.new(output_node.inputs['Surface'], mix_node.outputs['Shader'])
 
     return mat, mix_node
@@ -116,24 +118,21 @@ def _make_emission_path_material(name):
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
 
-    while nodes:
-        nodes.remove(nodes[0])
-    while links:
-        links.remove(links[0])
+    nodes.clear()
+    links.clear()
 
     emission_node = nodes.new('ShaderNodeEmission')
     transparent_node = nodes.new('ShaderNodeBsdfTransparent')
     mix_node = nodes.new('ShaderNodeMixShader')
     output_node = nodes.new('ShaderNodeOutputMaterial')
 
-    transparent_node.inputs[0].default_value = (1, 1, 1, 1)
+    transparent_node.inputs['Color'].default_value = (1, 1, 1, 1)
     emission_node.inputs['Strength'].default_value = 1
     emission_node.inputs['Color'].default_value = (1, 0, 1, 1)
-    mix_node.inputs[0].default_value = 0.0001
+    mix_node.inputs['Fac'].default_value = 0.0001
 
     links.new(mix_node.inputs[1], transparent_node.outputs['BSDF'])
     links.new(mix_node.inputs[2], emission_node.outputs['Emission'])
-
     links.new(output_node.inputs['Surface'], mix_node.outputs['Shader'])
 
     return mat
@@ -153,7 +152,7 @@ def make_path_object(points, n_sides, radius, obj_name, vis_start, vis_mid, vis_
     mesh.materials.append(mat)
 
     # Animate the mix node
-    inp = mix_node.inputs[0]
+    inp = mix_node.inputs['Fac']
 
     inp.default_value = 0.
     inp.keyframe_insert('default_value', frame=vis_start)
@@ -184,4 +183,3 @@ def path_objects_from_pickles(pickle_paths):
         obj_name = f'path_{i:05d}'
         make_path_object(points, 5, 10, obj_name, i, i + 10, i + 20)
         bpy.data.objects[obj_name].scale = 0.01, 0.01, 0.01
-

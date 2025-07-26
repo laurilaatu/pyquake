@@ -68,7 +68,8 @@
                 },
                 "asph3": {
                     "strength": 50,
-                    "sample_as_light": true
+                    "sample_as_light": true,
+                    "bbox": [[-64, -64, -64], [64, 64, 64]]
                 },
                 "recort41": {
                     "strength": 0,

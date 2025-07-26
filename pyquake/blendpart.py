@@ -29,7 +29,7 @@ import bpy_types
 import bmesh
 import numpy as np
 
-from . import blendmat
+from .blendmat import *
 
 
 class Particles:
@@ -50,19 +50,28 @@ class Particles:
         emitter.modifiers.new("explosion_particle_system", type='PARTICLE_SYSTEM')
 
         assert len(emitter.particle_systems) == 1
-        part = emitter.particle_systems[0].settings
+        psys = emitter.particle_systems[0]
+        part = psys.settings
 
         part.frame_start = int(round(start_time * fps))
         part.frame_end = int(round((start_time + 0.1) * fps))
         part.lifetime = int(round(fps))
         part.lifetime_random = 0.9
+        
+        # Velocity settings
         part.normal_factor = 0
-        part.factor_random = 0.5
+        # UPDATED: `factor_random` has been renamed to `velocity_factor_random`
+        part.velocity_factor_random = 0.5
+
+        # Render settings
         part.render_type = 'OBJECT'
         part.instance_object = self._explosion
         part.particle_size = 1
         part.size_random = 0.9
-        part.effector_weights.gravity = 0.01
+        
+        # Physics settings
+        if part.effector_weights:
+            part.effector_weights.gravity = 0.01
 
         emitter.show_instancer_for_render = False
         emitter.parent = self.root
@@ -77,20 +86,29 @@ class Particles:
         emitter.modifiers.new("teleport_particle_system", type='PARTICLE_SYSTEM')
 
         assert len(emitter.particle_systems) == 1
-        part = emitter.particle_systems[0].settings
-
+        psys = emitter.particle_systems[0]
+        part = psys.settings
+        
         part.frame_start = int(round(start_time * fps))
         part.frame_end = int(round((start_time + 0.1) * fps))
         part.lifetime = int(round(fps * 0.5))
         part.lifetime_random = 0.5
         part.emit_from = 'VOLUME'
+
+        # Velocity settings
         part.normal_factor = 0.02
-        part.factor_random = 0.02
+        # UPDATED: `factor_random` has been renamed to `velocity_factor_random`
+        part.velocity_factor_random = 0.02
+
+        # Render settings
         part.render_type = 'OBJECT'
         part.instance_object = self._teleport
         part.particle_size = 1
         part.size_random = 0.9
-        part.effector_weights.gravity = 0.00
+
+        # Physics settings
+        if part.effector_weights:
+            part.effector_weights.gravity = 0.00
 
         emitter.show_instancer_for_render = False
         emitter.parent = self.root
@@ -123,10 +141,13 @@ def _create_cuboid(mins, maxs, obj_name):
     centre = 0.5 * (maxs + mins)
 
     bm = bmesh.new()
-    d = bmesh.ops.create_cube(bm, size=1)
-    verts = d['verts']
-    bmesh.ops.scale(bm, vec=size, verts=verts)
-    bmesh.ops.translate(bm, vec=centre, verts=verts)
+    # Create cube with size 1, then scale and move it.
+    bmesh.ops.create_cube(bm, size=1.0)
+    
+    # The new cube's vertices are selected by default.
+    bmesh.ops.scale(bm, vec=size, verts=bm.verts)
+    bmesh.ops.translate(bm, vec=centre, verts=bm.verts)
+    
     bm.to_mesh(mesh)
     bm.free()
 
@@ -141,16 +162,17 @@ def _create_particle_root():
 
 def _create_explosion_particle_object():
     obj = _create_icosphere(1, 'explosion_particle')
-    obj.data.materials.append(blendmat.setup_explosion_particle_material('explosion').mat)
+    obj.data.materials.append(setup_explosion_particle_material('explosion').mat)
     obj.hide_render = True
+    obj.hide_viewport = True # Also hide in viewport
 
     return obj
 
 
 def _create_teleport_particle_object():
     obj = _create_icosphere(1, 'teleport_particle')
-    obj.data.materials.append(blendmat.setup_teleport_particle_material('teleport').mat)
+    obj.data.materials.append(setup_teleport_particle_material('teleport').mat)
     obj.hide_render = True
+    obj.hide_viewport = True # Also hide in viewport
 
     return obj
-

@@ -43,7 +43,7 @@ def _animate_model(m: md3.MD3, origin_obj, surf_objs, tag_objs, anim_info: md3.A
                    times: np.ndarray, anim_idxs: np.ndarray,
                    origin_tag_name: Optional[str], fps: float):
     if len({surf.num_frames for surf in m.surfaces}) != 1:
-        raise MalformedMD3Error('Surfaces have different numbers of frames')
+        raise ValueError('Surfaces have different numbers of frames')
 
     # Create shape keys for each surf/frame pair.
     shape_keys = []
@@ -69,12 +69,11 @@ def _animate_model(m: md3.MD3, origin_obj, surf_objs, tag_objs, anim_info: md3.A
         start_frame = int(start_time * fps)
         end_frame = int(end_time * fps)
 
-        # Work out which frames should be played during this period.
-        # TODO: rounding up to get `num_anim_frames` results in some short keyframes and therefore some jerky
-        # transitions.  However, rounding down we can miss short animations entirely.  Perhaps max(1, round(.)) rather
-        # than ceil(.)?  What does the game do?
         anim = anim_info.anims[anim_idx]
         num_anim_frames = int(np.ceil(anim.fps * (end_time - start_time)))
+        if num_anim_frames == 0:
+            continue
+            
         anim_frames = np.arange(num_anim_frames)
         if anim.looping_frames:
             anim_frames[anim.num_frames:] = (
@@ -122,26 +121,36 @@ def _animate_model(m: md3.MD3, origin_obj, surf_objs, tag_objs, anim_info: md3.A
                 origin_obj.rotation_quaternion = _quat_from_axis(origin_tag['axis'].T,
                                                                  origin_obj.rotation_quaternion)
                 origin_obj.location = -origin_tag['axis'].T @ origin_tag['origin']
+                origin_obj.keyframe_insert('rotation_quaternion', frame=blender_frame)
+                origin_obj.keyframe_insert('location', frame=blender_frame)
+
 
     # Make shape keys linearly interpolated.
     for surf_obj in surf_objs:
-        for c in surf_obj.data.shape_keys.animation_data.action.fcurves:
-            for kfp in c.keyframe_points:
-                kfp.interpolation = 'LINEAR'
+        if surf_obj.data.shape_keys and surf_obj.data.shape_keys.animation_data:
+            for c in surf_obj.data.shape_keys.animation_data.action.fcurves:
+                for kfp in c.keyframe_points:
+                    kfp.interpolation = 'LINEAR'
 
 
 def _set_surf_tcs(mesh, tris, tcs):
-    mesh.uv_layers.new()
+    # UPDATED: Explicitly name the new UV layer and access it by name for robustness.
+    uv_layer_data = mesh.uv_layers.new(name="MD3_UV")
 
     bm = bmesh.new()
     bm.from_mesh(mesh)
-    uv_layer = bm.loops.layers.uv[0]
+    uv_layer = bm.loops.layers.uv[uv_layer_data.name]
 
     for bm_face, tri in zip(bm.faces, tris):
-        for bm_loop, vert_idx in zip(bm_face.loops, tri):
-            bm_loop[uv_layer].uv = tcs[vert_idx]
+        # The loop order in a bmesh face is not guaranteed to match the vertex order of the triangle.
+        # We need to map them correctly.
+        vert_map = {v.index: i for i, v in enumerate(bm_face.verts)}
+        for bm_loop in bm_face.loops:
+            vert_idx_in_tri = vert_map[bm_loop.vert.index]
+            bm_loop[uv_layer].uv = tcs[tri[vert_idx_in_tri]]
 
     bm.to_mesh(mesh)
+    bm.free() # Good practice to free the bmesh data
 
 
 def add_model(m: md3.MD3, skin_ims: Dict[str, bpy.types.Image],
@@ -177,9 +186,9 @@ def add_model(m: md3.MD3, skin_ims: Dict[str, bpy.types.Image],
         bpy.context.scene.collection.objects.link(surf_obj)
         surf_obj.parent = origin_obj
 
-        if skin_ims[surf.name] is not None:
+        if surf.name in skin_ims and skin_ims[surf.name] is not None:
             mat = blendshader.setup_diffuse_material(skin_ims[surf.name], surf.name)
-            mesh.materials.append(mat)
+            mesh.materials.append(mat.mat) # Assign the material itself, not the wrapper
 
         _set_surf_tcs(mesh, surf.tris, surf.tcs)
 
@@ -222,15 +231,13 @@ def _load_im(fs: pk3.Filesystem, shader: str):
         try:
             with fs.open(path) as f:
                 im = blendshader.im_from_file(f, shader)
-        except FileNotFoundError as e:
+        except (FileNotFoundError, RuntimeError): # RuntimeError can be thrown by Blender for invalid images
             pass
         else:
-            break
-    else:
-        return None
-        #raise FileNotFoundError(f'Could not find image for shader {shader}')
-
-    return im
+            return im
+    
+    logger.warning(f'Could not find or load image for shader {shader}')
+    return None
 
 
 def _load_model_ims(fs: pk3.Filesystem, m: md3.MD3, skins: Dict[str, str]) -> Dict[str, bpy.types.Image]:
@@ -291,4 +298,3 @@ def add_player(fs: pk3.Filesystem, model: str, skin: str, weapon: str,
     lower_obj.parent = root_obj
 
     return root_obj, lower_obj
-

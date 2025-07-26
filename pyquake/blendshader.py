@@ -21,10 +21,11 @@ def im_from_file(f, name):
     else:
         bf = io.BytesIO(b)
         pil_im = PIL.Image.open(bf)
+        # Convert PIL image to a NumPy array
         a = (np.frombuffer(pil_im.tobytes(), dtype=np.uint8)
              .reshape((pil_im.size[1], pil_im.size[0], -1))) / 255.
 
-
+    # Ensure image has an alpha channel
     if a.shape[-1] == 3:
         a = np.concatenate([
             a,
@@ -47,10 +48,9 @@ def _new_mat(name):
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
 
-    while nodes:
-        nodes.remove(nodes[0])
-    while links:
-        links.remove(links[0])
+    # UPDATED: Use nodes.clear() for a cleaner way to remove default nodes
+    nodes.clear()
+    links.clear()
 
     return mat, nodes, links
 
@@ -60,13 +60,17 @@ def setup_diffuse_material(im: bpy.types.Image, mat_name: str):
 
     output_node = nodes.new('ShaderNodeOutputMaterial')
 
-    diffuse_node = nodes.new('ShaderNodeBsdfDiffuse')
-    links.new(output_node.inputs['Surface'], diffuse_node.outputs['BSDF'])
+    # UPDATED: Use Principled BSDF for modern PBR workflows.
+    # This provides a result almost identical to the old Diffuse BSDF
+    # while being the standard for current Blender versions.
+    principled_node = nodes.new('ShaderNodeBsdfPrincipled')
+    principled_node.inputs['Roughness'].default_value = 1.0
+    principled_node.inputs['Specular IOR Level'].default_value = 0.0 # 'Specular' was renamed in Blender 4.0
+    links.new(output_node.inputs['Surface'], principled_node.outputs['BSDF'])
 
     texture_node = nodes.new('ShaderNodeTexImage')
     texture_node.image = im
     texture_node.interpolation = 'Linear'
-    links.new(diffuse_node.inputs['Color'], texture_node.outputs['Color'])
+    links.new(principled_node.inputs['Base Color'], texture_node.outputs['Color'])
 
     return mat
-
